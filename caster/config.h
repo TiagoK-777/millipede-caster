@@ -283,6 +283,7 @@ struct config {
 	 */
 	const char *host_auth_filename;
 	const char *source_auth_filename;
+	const char *client_auth_filename;
 	const char *blocklist_filename;
 	const char *sourcetable_filename;
 	int sourcetable_priority;
@@ -321,6 +322,7 @@ struct config {
 	/* Auth file entries */
 	struct auth_entry *host_auth;
 	struct auth_entry *source_auth;
+	struct auth_entry *client_auth;
 
 	/* Quota/block list by IP prefix */
 	struct prefix_table *blocklist;

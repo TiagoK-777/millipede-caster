@@ -86,6 +86,13 @@ blocklist_file:	blocklist
 # Source credentials for local sources and their STR lines
 #
 source_auth_file:	/usr/local/etc/millipede/source.auth
+
+#
+# Consumer (client) credentials per mountpoint (optional)
+# Only mountpoints listed here will require authentication from consumers.
+#
+#client_auth_file:	/usr/local/etc/millipede/client.auth
+
 sourcetable_file:	/usr/local/etc/millipede/sourcetable.dat
 
 #

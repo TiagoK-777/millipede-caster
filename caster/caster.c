@@ -729,7 +729,7 @@ caster_reopen_logs(struct caster_state *this, struct config *config) {
 static int
 caster_reload_auth(struct caster_state *caster, struct config *new_config) {
 	int r = 0;
-	logfmt(&caster->flog, LOG_INFO, "Reloading %s and %s", new_config->host_auth_filename, new_config->source_auth_filename);
+	logfmt(&caster->flog, LOG_INFO, "Reloading %s, %s and %s", new_config->host_auth_filename, new_config->source_auth_filename, new_config->client_auth_filename ? new_config->client_auth_filename : "(no client_auth)");
 
 	if (new_config->host_auth_filename) {
 		struct auth_entry *tmp = auth_parse(caster, new_config->host_auth_filename);
@@ -742,6 +742,13 @@ caster_reload_auth(struct caster_state *caster, struct config *new_config) {
 		struct auth_entry *tmp = auth_parse(caster, new_config->source_auth_filename);
 		if (tmp != NULL) {
 			new_config->source_auth = tmp;
+		} else
+			r = -1;
+	}
+	if (new_config->client_auth_filename) {
+		struct auth_entry *tmp = auth_parse(caster, new_config->client_auth_filename);
+		if (tmp != NULL) {
+			new_config->client_auth = tmp;
 		} else
 			r = -1;
 	}

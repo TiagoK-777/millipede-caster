@@ -359,6 +359,8 @@ static const cyaml_schema_field_t top_mapping_schema[] = {
 	CYAML_FIELD_STRING_PTR(
 		"source_auth_file", CYAML_FLAG_POINTER, struct config, source_auth_filename, 0, CYAML_UNLIMITED),
 	CYAML_FIELD_STRING_PTR(
+		"client_auth_file", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL, struct config, client_auth_filename, 0, CYAML_UNLIMITED),
+	CYAML_FIELD_STRING_PTR(
 		"host_auth_file", CYAML_FLAG_POINTER, struct config, host_auth_filename, 0, CYAML_UNLIMITED),
 	CYAML_FIELD_STRING_PTR(
 		"blocklist_file", CYAML_FLAG_POINTER|CYAML_FLAG_OPTIONAL, struct config, blocklist_filename, 0, CYAML_UNLIMITED),
@@ -569,6 +571,7 @@ struct config *config_parse(const char *filename, long long config_gen) {
 	}
 	this->host_auth = NULL;
 	this->source_auth = NULL;
+	this->client_auth = NULL;
 	this->blocklist = NULL;
 	this->endpoints_json = _endpoints_json(this);
 	this->dyn = NULL;
@@ -642,6 +645,7 @@ void config_free(struct config *this) {
 	free((char *)this->syncer_auth);
 	free((char *)this->host_auth_filename);
 	free((char *)this->source_auth_filename);
+	free((char *)this->client_auth_filename);
 	free((char *)this->blocklist_filename);
 	free((char *)this->sourcetable_filename);
 	free((char *)this->log);
@@ -651,6 +655,8 @@ void config_free(struct config *this) {
 		auth_free(this->host_auth);
 	if (this->source_auth)
 		auth_free(this->source_auth);
+	if (this->client_auth)
+		auth_free(this->client_auth);
 	if (this->blocklist)
 		prefix_table_free(this->blocklist);
 	if (this->endpoints_json)

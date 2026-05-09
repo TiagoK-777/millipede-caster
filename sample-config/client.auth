@@ -1,0 +1,11 @@
+#
+# Client (consumer) authentication
+#
+# Format:
+#	MOUNTPOINT:username:password
+#
+# Only mountpoints listed here require authentication.
+# Mountpoints not listed remain publicly accessible.
+#
+# Example:
+#FAZENDA01:usuario_leitor:senha_leitura
