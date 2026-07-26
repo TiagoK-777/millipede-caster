@@ -7,5 +7,9 @@
 # Only mountpoints listed here require authentication.
 # Mountpoints not listed remain publicly accessible.
 #
+# Use "*" as the mountpoint to require authentication for every
+# mountpoint not explicitly listed, giving that user access to all bases.
+#
 # Example:
 #FAZENDA01:usuario_leitor:senha_leitura
+#*:tiago:12345678

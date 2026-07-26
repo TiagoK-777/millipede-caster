@@ -603,6 +603,17 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 								err = 401;
 								break;
 							}
+						} else {
+							/* No explicit entry: fall back to the wildcard entry, if any */
+							struct auth_entry *wentry = auth_lookup(config->client_auth, "*");
+							if (wentry != NULL
+								&& (!st->scheme_basic
+									|| !auth_check(config->client_auth, "*", st->user, st->password))) {
+								evhttp_add_header(&opt_headers,
+									"WWW-Authenticate", "Basic realm=\"NTRIP Caster\"");
+								err = 401;
+								break;
+							}
 						}
 					}
 						if (config->dyn->rtcm_filter && rtcm_filter_check_mountpoint(config->dyn, mountpoint))
