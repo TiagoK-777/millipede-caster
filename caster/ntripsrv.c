@@ -593,19 +593,18 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					int subscribe_ok = 0;
 
 					if (*mountpoint) {
-						if (config->client_auth) {
-							struct auth_entry *centry = auth_lookup(config->client_auth, mountpoint);
-							if (centry != NULL) {
-								if (!st->scheme_basic || !st->user || !st->password
-									|| strcmp(centry->user, st->user)
-									|| strcmp(centry->password, st->password)) {
-									evhttp_add_header(&opt_headers,
-										"WWW-Authenticate", "Basic realm=\"NTRIP Caster\"");
-									err = 401;
-									break;
-								}
+					if (config->client_auth) {
+						struct auth_entry *centry = auth_lookup(config->client_auth, mountpoint);
+						if (centry != NULL) {
+							if (!st->scheme_basic
+								|| !auth_check(config->client_auth, mountpoint, st->user, st->password)) {
+								evhttp_add_header(&opt_headers,
+									"WWW-Authenticate", "Basic realm=\"NTRIP Caster\"");
+								err = 401;
+								break;
 							}
 						}
+					}
 						if (config->dyn->rtcm_filter && rtcm_filter_check_mountpoint(config->dyn, mountpoint))
 							atomic_store(&st->use_rtcm_filter, 1);
 						/*

@@ -66,3 +66,24 @@ struct auth_entry *auth_lookup(struct auth_entry *auth, const char *key) {
 struct auth_entry *auth_lookupi(struct auth_entry *auth, const char *key) {
 	return _auth_lookup(auth, key, 1);
 }
+
+/*
+ * Validate credentials against all entries matching the given key.
+ * Returns the matching auth_entry if user and password match any entry,
+ * or NULL if no entry matches. Unlike auth_lookup, this iterates over
+ * every entry with the same key so multiple clients on the same
+ * mountpoint are all checked.
+ */
+struct auth_entry *auth_check(struct auth_entry *auth, const char *key,
+		const char *user, const char *password) {
+	if (user == NULL || password == NULL)
+		return NULL;
+	while (auth->user != NULL) {
+		if (strcmp(auth->key, key) == 0
+			&& strcmp(auth->user, user) == 0
+			&& strcmp(auth->password, password) == 0)
+			return auth;
+		auth++;
+	}
+	return NULL;
+}
