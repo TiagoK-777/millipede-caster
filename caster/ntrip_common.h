@@ -72,6 +72,7 @@ enum ntrip_rtcm_state {
  */
 
 struct rtcm_info;
+struct ntrip_task;
 
 struct ntrip_state {
 	/*
@@ -88,7 +89,7 @@ struct ntrip_state {
 	unsigned long long received_bytes, sent_bytes;
 
 	// reference count used in threaded mode for deferred calls
-	_Atomic int refcnt;
+	REFCNT;
 
 	/* linked-list pointers for main job queue */
 	STAILQ_ENTRY(ntrip_state) next;
@@ -191,7 +192,7 @@ struct ntrip_state {
 	struct ntrip_task *task;		// descriptor and callbacks for the current task
 	struct subscriber *subscription;	// current source subscription
 	char *uri;				// URI for requests
-	time_t last_send;			// last time a packet was sent to this client
+	_Atomic time_t last_send;		// last time a packet was sent to this client
 	json_object *node;			// node information from syncer client
 	char *syncer_id;			// livesource table id from remote syncer
 
@@ -204,7 +205,7 @@ struct ntrip_state {
 	pos_t tmp_pos;				// temporary: future source position redistribute_switch_source()
 	char user_agent_ntrip;			// Flag: set if the User-Agent header
 						// contains "ntrip" (case-insensitive)
-	const char *user_agent;			// User-Agent header, if present
+	char *user_agent;			// User-Agent header, if present
 	char wildcard;				// Flag: set for a source if the mountpoint is unregistered (wildcard entry)
 
 	char *query_string;			// HTTP GET query string, if any.
@@ -262,9 +263,10 @@ void ntrip_set_peeraddr(struct ntrip_state *this, struct sockaddr *sa, size_t so
 void ntrip_set_localaddr(struct ntrip_state *this);
 void ntrip_clear_request(struct ntrip_state *this);
 void ntrip_free(struct ntrip_state *this, char *orig);
-void ntrip_incref(struct ntrip_state *this, char *orig);
+
+REFCNT_INCREF2_DECL(ntrip_incref, struct ntrip_state);
+REFCNT_DECREF2_DECL(ntrip_decref, struct ntrip_state);
 void ntrip_decref_end(struct ntrip_state *this, char *orig);
-void ntrip_decref(struct ntrip_state *this, char *orig);
 void ntrip_deferred_run(struct caster_state *this);
 int ntrip_drop_by_id(struct caster_state *caster, long long id);
 void ntrip_unregister_livesource(struct ntrip_state *this);
@@ -287,6 +289,15 @@ static inline enum ntrip_session_state ntrip_get_state(struct ntrip_state *this)
 
 static inline void ntrip_set_state(struct ntrip_state *this, enum ntrip_session_state state) {
 	atomic_store(&this->state, state);
+}
+
+/*
+ * Read st->task. The caller must hold the ntrip_state's bufferevent lock
+ * (bev), which excludes the task-side writer (ntrip_task_clear_get_st also
+ * acquires bev). Returns the current task pointer or NULL.
+ */
+static inline struct ntrip_task *ntrip_state_task(struct ntrip_state *st) {
+	return st->task;
 }
 
 #endif

@@ -60,8 +60,9 @@ send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
 	msg = htc->message;
 
 	firstword = (this->client_version == 1 && firstword && this->user_agent_ntrip)?firstword:"HTTP/1.1";
-	struct tm *t = gmtime(&tstamp);
-	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", t);
+	struct tm t;
+	gmtime_r(&tstamp, &t);
+	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &t);
 
 	len = evbuffer_add_printf(ev, "%s %d %s\r\n%sDate: %s\r\n", firstword, status_code, msg, server_headers, date);
 	if (len > 0) sent += len;
@@ -503,6 +504,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						st->content_done = 0;
 					}
 				} else if (!strcasecmp(key, "content-type")) {
+					if (st->content_type != NULL)
+						strfree(st->content_type);
 					st->content_type = mystrdup(value);
 				} else if (!strcasecmp(key, "ntrip-version")) {
 					if (!strcasecmp(value, "ntrip/2.0"))
@@ -513,6 +516,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						// Set NTRIP version to 1, unless it is already known to be 2.
 						if (!st->client_version) st->client_version = 1;
 					}
+					if (st->user_agent != NULL)
+						strfree(st->user_agent);
 					st->user_agent = mystrdup(value);
 				} else if (!strcasecmp(key, "authorization")) {
 					ntrip_log(st, LOG_EDEBUG, "Header %s: *****", key);
@@ -585,7 +590,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 
 					char *mountpoint = st->http_args[1]+1;
 					struct sourceline *sourceline = NULL;
-					struct livesource *l = NULL;
+					int subscribe_ok = 0;
 
 					if (*mountpoint) {
 						if (config->client_auth) {
@@ -607,7 +612,20 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						 * Find both a relevant source line and a live source (actually live or on-demand).
 						 */
 						sourceline = stack_find_mountpoint(st->caster, &st->caster->sourcetablestack, mountpoint);
-						l = livesource_find_and_subscribe(st->caster, st, mountpoint, NULL, 1, sourceline?sourceline->on_demand:0);
+
+						//
+						// Don't subscribe to a livesource with the same name as the sourceline
+						// if the latter indicates the source is virtual: this would cause an assertion failure later
+						// in livesource_add_subcriber().
+						//
+						// This can happen after a sourcetable reload, where a configuration changes a given mountpoint
+						// from a regular source to a virtual source, including when using wildcards, ahd the previous
+						// livesource is still active.
+						//
+						if (sourceline == NULL || !sourceline->virtual)
+							subscribe_ok = livesource_find_and_subscribe(st->caster, st, mountpoint, NULL, 1, sourceline?sourceline->on_demand:0);
+						else
+							subscribe_ok = 0;
 					}
 
 					/*
@@ -616,7 +634,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					 *
 					 * Empty mountpoint name: always reply with the sourcetable.
 					 */
-					if (*mountpoint == '\0' || (!sourceline && !l && st->client_version == 1)) {
+					if (*mountpoint == '\0' || (!sourceline && !subscribe_ok && st->client_version == 1)) {
 						st->type = "client";
 						err = ntripsrv_send_sourcetable(st, output);
 						if (st->connection_keepalive && st->received_keepalive) {
@@ -631,7 +649,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 						}
 					}
 					st->connection_keepalive = 0;
-					if (!sourceline && !l) {
+					if (!sourceline && !subscribe_ok) {
 						err = 404;
 						break;
 					}
@@ -651,7 +669,7 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					bufferevent_set_timeouts(bev, &read_timeout, NULL);
 
 					if (!st->source_virtual) {
-						if (!l) {
+						if (!subscribe_ok) {
 							if (st->client_version == 1) {
 								err = ntripsrv_send_sourcetable(st, output);
 								ntrip_set_state(st, NTRIP_WAIT_CLOSE);
@@ -908,7 +926,7 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 			 * recently sending data.
 			 */
 			if (ntrip_get_state(st) == NTRIP_WAIT_CLIENT_INPUT) {
-				int idle_time = time(NULL) - st->last_send;
+				int idle_time = time(NULL) - atomic_load(&st->last_send);
 				if (idle_time <= config->idle_max_delay) {
 					/* Re-enable read */
 					bufferevent_enable(bev, EV_READ);

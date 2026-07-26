@@ -470,7 +470,7 @@ struct config *config_parse(const char *filename, long long config_gen) {
 		return NULL;
 	}
 	this->gen = config_gen;
-	atomic_init(&this->refcnt, 1);
+	REFCNT_INIT(this);
 
 #define	DEFAULT_ASSIGN(this, field)		{if (!(this)->field) {(this)->field = default_config.field;}}
 /* Special for string fields, to avoid a crash at free() */
@@ -618,6 +618,8 @@ void config_free(struct config *this) {
 	}
 	free(this->endpoint);
 
+	free(this->syslog);
+
 	for (int i = 0; i < this->graylog_count; i++) {
 		free((char *)this->graylog[i].host);
 		free((char *)this->graylog[i].uri);
@@ -642,6 +644,7 @@ void config_free(struct config *this) {
 	free(this->threads);
 
 	free((char *)this->trusted_http_proxy);
+	free((char *)this->trusted_http_ip_header);
 	free((char *)this->syncer_auth);
 	free((char *)this->host_auth_filename);
 	free((char *)this->source_auth_filename);

@@ -53,7 +53,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 	this->port = port;
 	time_t t = time(NULL);
 	this->last_useful = t;
-	this->last_send = t;
+	atomic_store(&this->last_send, t);
 	this->subscription = NULL;
 	this->server_version = 2;
 	this->client_version = 0;
@@ -77,7 +77,7 @@ struct ntrip_state *ntrip_new(struct caster_state *caster, struct bufferevent *b
 		STAILQ_INIT(&this->jobq);
 	this->njobs = 0;
 	this->newjobs = 0;
-	atomic_init(&this->refcnt, 1);
+	REFCNT_INIT(this);
 	this->bev_freed = 0;
 	this->bev_close_on_free = 0;
 	this->bev = bev;
@@ -344,6 +344,8 @@ static void _ntrip_common_free(struct ntrip_state *this) {
 	strfree(this->content_type);
 	strfree((char *)this->user_agent);
 	strfree(this->query_string);
+	if (this->rtcm_info != NULL)
+		rtcm_info_decref(this->rtcm_info);
 }
 
 /*
@@ -445,22 +447,13 @@ static void ntrip_deferred_free2(struct ntrip_state *this) {
  * Increment reference counter.
  * No lock needed.
  */
-void ntrip_incref(struct ntrip_state *this, char *orig) {
-	assert(this->refcnt > 0);
-	atomic_fetch_add(&this->refcnt, 1);
-}
+REFCNT_INCREF2_BODY(ntrip_incref, struct ntrip_state);
 
 /*
  * Decrement reference counter.
  * Required lock: ntrip_state
  */
-void ntrip_decref(struct ntrip_state *this, char *orig) {
-	assert(this->refcnt > 0);
-	if (atomic_fetch_sub(&this->refcnt, 1) == 1) {
-		assert(ntrip_get_state(this) == NTRIP_END);
-		ntrip_deferred_free(this, orig);
-	}
-}
+REFCNT_DECREF2_BODY(ntrip_decref, struct ntrip_state, ntrip_deferred_free);
 
 /*
  * Set ntrip_state in the NTRIP_END state (end of connection).
@@ -501,6 +494,7 @@ void ntrip_decref_end(struct ntrip_state *this, char *orig) {
  * Required lock: ntrip_state
  */
 static void ntrip_deferred_free(struct ntrip_state *this, char *orig) {
+	assert(ntrip_get_state(this) == NTRIP_END);
 	struct bufferevent *bev = this->bev;
 
 	bufferevent_disable(bev, EV_READ|EV_WRITE);
@@ -654,9 +648,10 @@ void ntrip_notify_close(struct ntrip_state *st) {
 	if (!st->client)
 		return;
 
-	if (st->task != NULL) {
+	if (ntrip_state_task(st) != NULL) {
+		struct ntrip_task *task = ntrip_state_task(st);
 		/* Notify the callback the transfer is over, and failed. */
-		st->task->end_cb(0, st->task->end_cb_arg, st->task->cb_arg2);
+		task->end_cb(0, task->end_cb_arg, task->cb_arg2);
 		st->task = NULL;
 	}
 }
@@ -879,23 +874,25 @@ void ntrip_set_rtcm_cache(struct ntrip_state *st) {
 		assert(e != -1);
 		if (e == -2) {
 			/* Out of memory */
-			rtcm_info_free(rp);
+			rtcm_info_decref(rp);
+			rp = NULL;
 		}
 	}
+	if (rp != NULL)
+		rtcm_info_incref(rp);
 	st->rtcm_info = rp;
 	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
 }
 
 struct packet *ntrip_get_rtcm_pos(struct ntrip_state *st, const char *mountpoint) {
+	struct packet *p;
+
 	P_RWLOCK_RDLOCK(&st->caster->rtcm_lock);
 	struct rtcm_info *rp = (struct rtcm_info *)hash_table_get(st->caster->rtcm_cache, mountpoint);
-	if (rp == NULL) {
-		P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
-		return NULL;
-	}
-	struct packet *p = rtcm_info_pos_packet(rp, st->caster);
-	if (p)
-		packet_incref(p);
+	if (rp != NULL)
+		p = rtcm_info_pos_packet(rp, st->caster);
+	else
+		p = NULL;
 	P_RWLOCK_UNLOCK(&st->caster->rtcm_lock);
 	return p;
 }

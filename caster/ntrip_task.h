@@ -7,6 +7,7 @@
 
 #include "conf.h"
 #include "ntrip_common.h"
+#include "refcnt.h"
 
 enum task_state {
 	TASK_INIT,
@@ -16,9 +17,25 @@ enum task_state {
 
 /*
  * Descriptor for a regularly scheduled outgoing connection task.
+ *
+ * Locking model for the task<->connection pair:
+ *
+ *   st->task  is protected by the ntrip_state's bufferevent lock ("bev").
+ *             Every libevent callback already holds bev; the task side must
+ *             also acquire bev before writing st->task.
+ *
+ *   task->st  is protected by task->st_lock.
+ *
+ *   Nested lock order:  bev  ->  st_lock.
+ *   Never acquire bev while holding st_lock.
+ *
+ *   task->st is a counted reference (taken by ntrip_task_set_st).
+ *   st->task is an uncounted back-pointer; it is safe because the task
+ *   side acquires bev (via ntrip_task_stop) before the task can be freed,
+ *   excluding any in-progress connection callback.
  */
 struct ntrip_task {
-	_Atomic int refcnt;
+	REFCNT;
 
 	/* Host, port, whether to use TLS */
 	char *host;
@@ -68,7 +85,7 @@ struct ntrip_task {
 
 	void (*connect_cb)(struct ntrip_state *st);
 
-	/* Current ntrip_state, if any */
+	/* Current ntrip_state, if any. Protected by st_lock. */
 	struct ntrip_state *st;
 	struct timeval start;
 
@@ -124,10 +141,34 @@ struct ntrip_task *ntrip_task_new(struct caster_state *caster,
 	const char *host, unsigned short port, const char *uri, int tls, int refresh_delay,
 	size_t bulk_max_size, size_t queue_max_size, const char *type, const char *drainfilename);
 void ntrip_task_ack_pending(struct ntrip_task *this);
-void ntrip_task_incref(struct ntrip_task *this);
-void ntrip_task_decref(struct ntrip_task *this);
-struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this, int getref);
+REFCNT_INCREF_DECL(ntrip_task_incref, struct ntrip_task);
+REFCNT_DECREF_DECL(ntrip_task_decref, struct ntrip_task);
+
+/*
+ * Clear task->st and the matching st->task back-pointer.
+ *
+ * Required lock: the bufferevent lock (bev) of task->st, if non-NULL.
+ * Returns a counted reference to the former task->st (transferred from the
+ * task's own reference), or NULL if task->st was already NULL. The caller
+ * must ntrip_decref() the returned reference.
+ */
+struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this);
+
+/*
+ * Clear task->st and the matching st->task back-pointer, then drop the
+ * task's reference to the former st.
+ *
+ * Required lock: the bufferevent lock (bev) of task->st, if non-NULL.
+ * No-op (returns NULL) if task->st is already NULL.
+ */
 void ntrip_task_clear_st(struct ntrip_task *this);
+
+/*
+ * Return a counted reference to the ntrip_state, or NULL.
+ * The caller must ntrip_decref() the returned reference.
+ */
+struct ntrip_state *ntrip_task_get_st_ref(struct ntrip_task *this);
+
 enum task_state ntrip_task_get_state(struct ntrip_task *this);
 int ntrip_task_start(struct ntrip_task *this, void *reschedule_arg, struct livesource *livesource, int persistent,
 	struct config *new_config);
