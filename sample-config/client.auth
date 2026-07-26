@@ -7,8 +7,9 @@
 # Only mountpoints listed here require authentication.
 # Mountpoints not listed remain publicly accessible.
 #
-# Use "*" as the mountpoint to require authentication for every
-# mountpoint not explicitly listed, giving that user access to all bases.
+# Use "*" as the mountpoint to declare a master user whose credentials
+# grant access to every base, including those with their own explicit entry.
+# Other users must use the credentials defined for each specific mountpoint.
 #
 # Example:
 #FAZENDA01:usuario_leitor:senha_leitura

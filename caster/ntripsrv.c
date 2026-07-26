@@ -595,20 +595,22 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 					if (*mountpoint) {
 					if (config->client_auth) {
 						struct auth_entry *centry = auth_lookup(config->client_auth, mountpoint);
-						if (centry != NULL) {
-							if (!st->scheme_basic
-								|| !auth_check(config->client_auth, mountpoint, st->user, st->password)) {
-								evhttp_add_header(&opt_headers,
-									"WWW-Authenticate", "Basic realm=\"NTRIP Caster\"");
-								err = 401;
-								break;
-							}
-						} else {
-							/* No explicit entry: fall back to the wildcard entry, if any */
-							struct auth_entry *wentry = auth_lookup(config->client_auth, "*");
-							if (wentry != NULL
-								&& (!st->scheme_basic
-									|| !auth_check(config->client_auth, "*", st->user, st->password))) {
+						struct auth_entry *wentry = auth_lookup(config->client_auth, "*");
+						/*
+						 * Authentication is required when either an explicit
+						 * entry exists for this mountpoint or a wildcard ("*")
+						 * entry exists. A matching wildcard grants access to
+						 * every mountpoint, including those with explicit entries
+						 * (master user), while explicit entries keep their own
+						 * credentials for non-wildcard users.
+						 */
+						if (centry != NULL || wentry != NULL) {
+							int auth_ok = st->scheme_basic
+								&& ((centry != NULL
+									&& auth_check(config->client_auth, mountpoint, st->user, st->password))
+								|| (wentry != NULL
+									&& auth_check(config->client_auth, "*", st->user, st->password)));
+							if (!auth_ok) {
 								evhttp_add_header(&opt_headers,
 									"WWW-Authenticate", "Basic realm=\"NTRIP Caster\"");
 								err = 401;
