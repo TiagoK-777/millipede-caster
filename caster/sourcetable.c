@@ -1,6 +1,7 @@
 #include "conf.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -197,14 +198,25 @@ struct mime_content *sourcetable_get(struct sourcetable *this) {
 		int ne;
 		ep = hash_array(this->key_val, &ne);
 
-		strcpy(s, this->header);
+		/*
+		 * Append at a running offset: strcat() would rescan the whole string for
+		 * each line, quadratic in the size of the table (about 300 MB read per
+		 * request for 1 500 lines).
+		 */
+		char *p = s;
+		size_t l = strlen(this->header);
+		memcpy(p, this->header, l);
+		p += l;
 		for (int i = 0; i < ne; i++) {
 			e = ep[i];
 			n = (struct sourceline *)e->value;
-			strcat(s, n->value);
-			strcat(s, "\r\n");
+			l = strlen(n->value);
+			memcpy(p, n->value, l);
+			p += l;
+			memcpy(p, "\r\n", 2);
+			p += 2;
 		}
-		strcat(s, "ENDSOURCETABLE\r\n");
+		strcpy(p, "ENDSOURCETABLE\r\n");
 		hash_array_free(ep);
 	}
 	P_RWLOCK_UNLOCK(&this->lock);
@@ -684,6 +696,15 @@ struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_
 		HASH_FOREACH(e, s->key_val, hi) {
 			struct sourceline *sp = (struct sourceline *)e->value;
 			/*
+			 * Out of range: never added, whatever else is true. Test it first, as it is
+			 * cheap and drops most of the table, before the locked lookups below.
+			 */
+			if (pos) {
+				double dist =  distance(&sp->pos, pos);
+				if (isnan(dist) || dist >= max_dist)
+					continue;
+			}
+			/*
 			 * If the mountpoint is from our local table, skip if not live.
 			 */
 			if (local_table && (!sp->virtual && !livesource_exists(caster, sp->key, &sp->pos)))
@@ -691,18 +712,11 @@ struct sourcetable *stack_flatten_dist(struct caster_state *caster, sourcetable_
 
 			struct element *e = hash_table_get_element(r->key_val, sp->key);
 
-			if (e == NULL) {
-				/*
-				 * Entry not found, meaning it has the highest priority:
-				 * add it if within maximum distance.
-				 */
-				if (!pos || distance(&sp->pos, pos) < max_dist) {
-					if (_sourcetable_add_direct(r, sp) < 0) {
-						P_RWLOCK_UNLOCK(&s->lock);
-						P_RWLOCK_UNLOCK(&this->lock);
-						goto cancel;
-					}
-				}
+			/* Entry not found, meaning it has the highest priority: add it. */
+			if (e == NULL && _sourcetable_add_direct(r, sp) < 0) {
+					P_RWLOCK_UNLOCK(&s->lock);
+					P_RWLOCK_UNLOCK(&this->lock);
+					goto cancel;
 			}
 		}
 

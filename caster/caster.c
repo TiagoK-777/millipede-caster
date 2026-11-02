@@ -169,14 +169,16 @@ static void
 dynconfig_free_syncers(struct caster_dynconfig *dyn) {
 	if (dyn->syncers == NULL)
 		return;
-	for (int i = 0; i < dyn->syncers_count; i++) {
+	/* Stop anyone else looking before the entries go away, not after. */
+	int n = dyn->syncers_count;
+	dyn->syncers_count = 0;
+	for (int i = 0; i < n; i++) {
 		if (dyn->syncers[i] != NULL) {
-			syncer_free(dyn->syncers[i]);
+			syncer_decref(dyn->syncers[i]);
 			dyn->syncers[i] = NULL;
 		}
 	}
 	free(dyn->syncers);
-	dyn->syncers_count = 0;
 	dyn->syncers = NULL;
 }
 
@@ -372,16 +374,20 @@ static int caster_reload_syncers(struct caster_state *this, struct config *confi
 
 	if (olddyn != NULL && olddyn->syncers != NULL && olddyn->syncers_count == newdyn->syncers_count) {
 		newdyn->syncers_count = olddyn->syncers_count;
+		/*
+		 * Share the syncer rather than take it out of the old configuration: worker threads
+		 * may still read olddyn->syncers[] until their reference to it is dropped.
+		 */
 		for (int i = 0; i < newdyn->syncers_count; i++) {
 			newdyn->syncers[i] = olddyn->syncers[i];
-			olddyn->syncers[i] = NULL;
+			syncer_incref(newdyn->syncers[i]);
 		}
 	} else {
 		for (int i = 0; i < newdyn->syncers_count; i++) {
 			newdyn->syncers[i] = syncer_new(this, config->node, config->node_count, "/adm/api/v1/sync", 0);
 			if (newdyn->syncers[i] == NULL) {
 				for (int j = 0; j < i; j++)
-					syncer_free(newdyn->syncers[j]);
+					syncer_decref(newdyn->syncers[j]);
 				free(newdyn->syncers);
 				return -1;
 			}
@@ -455,7 +461,7 @@ static int caster_start_graylog(struct caster_state *this, struct config *new_co
 /*
  * Stop all caster activity, then free the structures.
  */
-void caster_free(struct caster_state *this) {
+int caster_free(struct caster_state *this) {
 	if (this->config) {
 		/* Stop accepting incoming connections */
 		dynconfig_free_listeners(this->config->dyn);
@@ -472,13 +478,14 @@ void caster_free(struct caster_state *this) {
 	ntrip_drop_by_id(this, 0);
 
 	/* Wait for the threads to finish their tasks */
-	if (threads)
-		jobs_stop_threads(this->joblist);
+	if (threads && jobs_stop_threads(this->joblist) != 0)
+		return -1;
 
 	caster_clear_signals(this);
 	log_free(&this->flog);
 	log_free(&this->alog);
 	_caster_common_free(this);
+	return 0;
 }
 
 /*
@@ -819,13 +826,12 @@ static struct config *caster_load_config(struct caster_state *this) {
 static void
 signal_cb(evutil_socket_t sig, short events, void *user_data) {
 	struct caster_signal_cb_info *info = user_data;
-	struct timeval delay = { 0, 0 };
 
 	printf("Caught %s signal; exiting.\n", info->signame);
 	logfmt(&info->caster->flog, LOG_INFO, "Caught %s signal; exiting.", info->signame);
 
-	for (int i = 0; i < info->caster->nbase; i++)
-		event_base_loopexit(info->caster->base[i], &delay);
+	// Exit the main thread loop only: it will run the general termination.
+	event_base_loopexit(info->caster->base[0], NULL);
 }
 
 static int caster_start(struct caster_state *this, struct config *new_config, int lock) {
@@ -869,7 +875,11 @@ static int caster_load(struct caster_state *this, int restart) {
 	}
 	new_config->dyn = newdyn;
 	new_config->free_callback = dynconfig_free_callback;
+
 	old_config = atomic_load(&this->config);
+	if (old_config)
+		config_incref(old_config);
+
 	olddyn = old_config?old_config->dyn:NULL;
 
 	if (caster_reopen_logs(this, new_config) < 0)
@@ -897,8 +907,10 @@ static int caster_load(struct caster_state *this, int restart) {
 	if (caster_reload_listeners(this, new_config, olddyn, newdyn) < 0)
 		r = -1;
 
-	if (old_config)
-		config_decref(old_config);
+	if (old_config) {
+		config_decref(old_config);	// our temporary reference
+		config_decref(old_config);	// caster's reference
+	}
 
 	if (restart && caster_start(this, new_config, 0) < 0)
 		r = -1;
@@ -942,13 +954,16 @@ static int caster_set_signals(struct caster_state *this) {
 	this->sigint_info.signame = "SIGINT";
 	this->sigterm_info.signame = "SIGTERM";
 	this->sigterm_info.caster = this;
-	this->signalint_event = evsignal_new(caster_get_eventbase(this), SIGINT, signal_cb, (void *)&this->sigint_info);
+
+	/* Use base[0] to set all handlers because libevent wants all signals on the same event base */
+
+	this->signalint_event = evsignal_new(this->base[0], SIGINT, signal_cb, (void *)&this->sigint_info);
 	if (!this->signalint_event || event_add(this->signalint_event, NULL) < 0) {
 		fprintf(stderr, "Could not create/add SIGINT signal event!\n");
 		return -1;
 	}
 
-	this->signalterm_event = evsignal_new(caster_get_eventbase(this), SIGTERM, signal_cb, (void *)&this->sigterm_info);
+	this->signalterm_event = evsignal_new(this->base[0], SIGTERM, signal_cb, (void *)&this->sigterm_info);
 	if (!this->signalterm_event || event_add(this->signalterm_event, NULL) < 0) {
 		fprintf(stderr, "Could not create/add SIGTERM signal event!\n");
 		return -1;
@@ -956,7 +971,7 @@ static int caster_set_signals(struct caster_state *this) {
 
 	signal(SIGPIPE, SIG_IGN);
 
-	this->signalhup_event = evsignal_new(caster_get_eventbase(this), SIGHUP, signalhup_cb, (void *)this);
+	this->signalhup_event = evsignal_new(this->base[0], SIGHUP, signalhup_cb, (void *)this);
 	if (!this->signalhup_event || event_add(this->signalhup_event, 0) < 0) {
 		fprintf(stderr, "Could not create/add SIGHUP signal event!\n");
 		return -1;
@@ -1090,6 +1105,5 @@ int caster_main(char *config_file) {
 	event_base_dispatch(caster->base[0]);
 
 	logfmt(&caster->flog, LOG_NOTICE, "Stopping caster");
-	caster_free(caster);
-	return 0;
+	return caster_free(caster) < 0 ? 1:0;
 }

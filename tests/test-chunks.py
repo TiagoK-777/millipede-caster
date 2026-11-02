@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/usr/bin/env python3
 
 import re
 import socket
@@ -27,7 +27,7 @@ test_series = [
   [(b'EF\r\n', b'EF'),
    (b'W\r\n01234', b'^$'),
   ],
-  [(b'EF\r\nW\r\nVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV', b'^$'),
+  [(b'EF\r\nW\r\nVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV', b'^EF$'),
   ],
 ]
 

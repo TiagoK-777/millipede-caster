@@ -1,17 +1,21 @@
-#!/usr/local/bin/python3
+#!/usr/bin/env python3
 
 import base64
+import json
 import re
 import socket
 import sys
 import threading
 import time
 
+# RTCM type 1006 packet to unlock sources in NEAR/V
+rtcm_1006 = b"\xd3\x00\x15\x3e\xe0\x00\x03\x89\xc8\x55\xac\xd7\x80\x71\x2a\x81\xc9\x8b\x20\x8b\x7f\x54\x00\x00\x7c\x4f\x32"
+
 #
 # Source stream to server on a given mountpoint, user+password, number of samples
 #
 class SourceStream(object):
-  def __init__(self, host, mountpoint, userpass, n, start_delay=0, packet_delay=1, packet=None, post=True):
+  def __init__(self, host, mountpoint, userpass, n, start_delay=0, packet_delay=1, packet=None, start_packet=None, post=True):
     self._stop = False
     self._ok = False
     self.host = host
@@ -22,6 +26,7 @@ class SourceStream(object):
     self.start_delay = start_delay
     self.packet_delay = packet_delay
     self.packet = packet
+    self.start_packet = start_packet
     self.post = post
     self.status = None
     self.httpreply = None
@@ -46,6 +51,11 @@ class SourceStream(object):
     self.status = httpreply[1]
     self.httpreply = sdata.split(b'\r', 1)[0]
     self._ok = True
+
+    if self.start_packet:
+      ssource.sendall(self.start_packet)
+      time.sleep(self.packet_delay)
+
     for i in range(self.n):
       if self._stop:
         break
@@ -70,9 +80,11 @@ class ClientStream(object):
     self.host = host
     self.n = n
     self.err = 0
+    self.err_recv = 0
     self.firstline = firstline.encode('ascii')
     self._stop = False
     self.re_expect = None
+    self.ok = 0
   def set_expect(self, re_expect):
     self.re_expect = None if re_expect is None else re.compile(re_expect.encode('ascii'))
   def start(self):
@@ -102,10 +114,11 @@ class ClientStream(object):
         print(".", end='')
       elif self.re_expect.match(data):
         print(".", end='')
+        self.ok += 1
       else:
         print("Got", data)
         print("X", end='')
-        self.err += 1
+        self.err_recv += 1
       sys.stdout.flush()
     if self.n:
       print()
@@ -149,7 +162,7 @@ class SourceServer(object):
     sl.bind(self.host)
     sl.listen(200)
 
-    str_request = b'^GET (/.*) HTTP/1\.[01]'
+    str_request = b'^GET (/.*) HTTP/1\\.[01]'
     self.re_request = re.compile(str_request)
 
     sl.setblocking(False)
@@ -227,7 +240,7 @@ def API_reload(host, port):
   except TimeoutError:
     return 1
   s.close()
-  if not re.compile(b'^HTTP/1\.1 200 OK\r\nServer: NTRIP Millipede Server .*\r\nDate: .*\r\nNtrip-Version: Ntrip/2\.0\r\nContent-Length: \d+\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"result": 0}').match(d):
+  if not re.compile(b'^HTTP/1\\.1 200 OK\r\nServer: NTRIP Millipede Server .*\r\nDate: .*\r\nNtrip-Version: Ntrip/2\\.0\r\nContent-Length: \\d+\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"result": 0}').match(d):
     return 1
   return 0
 
@@ -246,6 +259,8 @@ class HttpServer(object):
     self.maxaccept = maxaccept
     self.timeout = timeout
     self._stop = False
+    # Request bodies received, in order
+    self.bodies = []
     self.replies = [
       b'HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 4\r\n\r\nABCD',
       b'HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n',
@@ -298,6 +313,7 @@ class HttpServer(object):
             while len(data) < length:
               d = s.recv(10240)
               data += d
+            self.bodies.append(data[:length])
             s.send(self.replies[self.nr % len(self.replies)])
             self.nr += 1
             data = b''
@@ -316,7 +332,7 @@ def TestServerAlive(host, port):
   s.settimeout(.1)
   try:
     s.connect((host, port))
-    s.sendall(b'GET /TEST1 HTTP/1.1\r\nUser-Agent: NTRIP test\r\nNtrip-Version: Ntrip/2.0\r\n\r\n')
+    s.sendall(b'GET /TEST404 HTTP/1.1\r\nUser-Agent: NTRIP test\r\nNtrip-Version: Ntrip/2.0\r\n\r\n')
   except TimeoutError:
     return 1
   except ConnectionRefusedError:
@@ -336,3 +352,68 @@ def TestServerAlive(host, port):
   if not data.startswith(b'HTTP/1.1 404 Not Found'):
     return 1
   return 0
+
+#
+# One sync connection to the caster's /adm/api/v1/sync, kept open the way a node keeps it:
+# the caster destroys a node's livesource table as soon as its connection closes
+# (ntripsrv.c), so a test that opens a connection per update sees an empty table on the
+# next one.
+#
+class SyncPoster(object):
+  def __init__(self, host, port):
+    self.s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    self.s.settimeout(5)
+    self.s.connect((host, port))
+    self.buf = b''
+
+  def post(self, body, auth):
+    """POST one update. Return the HTTP status, or 0 if the caster did not answer."""
+    b = json.dumps(body).encode()
+    try:
+      self.s.sendall(b'POST /adm/api/v1/sync HTTP/1.1\r\nAuthorization: internal ' + auth
+        + b'\r\nContent-Type: application/json\r\nContent-Length: '
+        + str(len(b)).encode() + b'\r\n\r\n' + b)
+      while b'\r\n\r\n' not in self.buf:
+        d = self.s.recv(65536)
+        if not d:
+          return 0
+        self.buf += d
+      head, self.buf = self.buf.split(b'\r\n\r\n', 1)
+      m = re.search(b'Content-Length: (\\d+)', head)
+      n = int(m.group(1)) if m else 0
+      while len(self.buf) < n:
+        d = self.s.recv(65536)
+        if not d:
+          break
+        self.buf += d
+      self.buf = self.buf[n:]
+      m = re.match(b'HTTP/1\\.1 (\\d+)', head)
+      return int(m.group(1)) if m else 0
+    except (OSError, TimeoutError):
+      return 0
+
+  def close(self):
+    self.s.close()
+
+
+def admin_get(host, port, uri):
+  """GET an /adm endpoint on its own connection. Return the body, or None."""
+  s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+  s.settimeout(5)
+  try:
+    s.connect((host, port))
+    s.sendall(('GET %s?user=admin&password=%%3dadminpw... HTTP/1.1\r\n'
+      'Content-Length: 0\r\nConnection: close\r\n\r\n' % uri).encode())
+    d = b''
+    while True:
+      r = s.recv(65536)
+      if not r:
+        break
+      d += r
+  except (OSError, TimeoutError):
+    return None
+  finally:
+    s.close()
+  if not d.startswith(b'HTTP/1.1 200') or b'\r\n\r\n' not in d:
+    return None
+  return d.split(b'\r\n\r\n', 1)[1]

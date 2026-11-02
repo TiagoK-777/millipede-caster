@@ -11,6 +11,7 @@
 
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
+#include <event2/event.h>
 
 #include "conf.h"
 #include "caster.h"
@@ -280,6 +281,18 @@ void ntrip_set_localaddr(struct ntrip_state *this) {
 	ip_str(&this->myaddr, this->local_addr, sizeof this->local_addr);
 }
 
+/*
+ * Close a file descriptor, from the event loop of its former bufferevent.
+ *
+ * Log close() failures (typically EBADF), which are an early sign
+ * of something amiss.
+ */
+static void deferred_close_cb(evutil_socket_t fd, short what, void *arg) {
+	struct caster_state *caster = arg;
+	if (close(fd) < 0)
+		logfmt(&caster->flog, LOG_NOTICE, "CLOSE fd %d err %d", fd, errno);
+}
+
 static void my_bufferevent_free(struct ntrip_state *this, struct bufferevent *bev) {
 	if (!this->bev_freed) {
 		ntrip_log(this, LOG_EDEBUG, "bufferevent_free %p", bev);
@@ -309,11 +322,23 @@ static void my_bufferevent_free(struct ntrip_state *this, struct bufferevent *be
 			bufferevent_setfd(this->bev, -1);
 
 			/*
-			 * Log close() failures (typically EBADF), which are an early sign
-			 * of something amiss.
+			 * Don't close() here: the bufferevent's event loop may already
+			 * be running one of its callbacks with this fd, waiting for the
+			 * lock we hold. Closed now, the fd can be reused by accept()
+			 * before that callback runs, which then reads or writes the new
+			 * connection. Close it from that event loop instead, after any
+			 * callback it has already dispatched.
+			 *
+			 * EV_WRITE with a zero timeout: the callback runs on the next loop
+			 * iteration and, unlike a pure timer, is passed the fd, so nothing
+			 * is allocated here that could leak if the loop stops first.
+			 *
+			 * close() here as a last resort iff event_base_once() fails.
 			 */
-			if (close(this->fd) < 0)
-				ntrip_log(this, LOG_NOTICE, "CLOSE fd %d err %d", this->fd, errno);
+			struct timeval now = { 0, 0 };
+			if (event_base_once(bufferevent_get_base(bev), this->fd, EV_WRITE, deferred_close_cb, this->caster, &now) < 0
+			    && close(this->fd) < 0)
+				ntrip_log(this, LOG_NOTICE, "event_base_once failed; CLOSE fd %d err %d", this->fd, errno);
 		}
 		bufferevent_free(bev);
 		this->bev_freed = 1;
@@ -588,32 +613,36 @@ int ntrip_drop_by_id(struct caster_state *caster, long long id) {
 
 	struct ntrip_state *st;
 
+	/* To avoid infinite loops, never kill an id more than once */
+	long long restart_id = 0;
+
     restart:
 	P_RWLOCK_WRLOCK(&caster->ntrips.lock);
 	TAILQ_FOREACH(st, &caster->ntrips.queue, nextg) {
 		struct bufferevent *bev = st->bev;
-		bufferevent_lock(bev);
-		if (id && st->id > id) {
-			bufferevent_unlock(bev);
+
+		if (st->id < restart_id)
+			continue;
+		if (id && st->id > id)
 			break;
-		}
+
 		if (id == 0 || st->id == id) {
+			bufferevent_lock(bev);
+			restart_id = st->id + 1;
 			ntrip_notify_close(st);
 			ntrip_decref_end(st, "ntrip_drop_by_id");
 			r += 1;
 			bufferevent_unlock(bev);
 			if (id)
 				break;
-			else {
-				// Restart from the head, as
-				// TAILQ_FOREACH_SAFE does not
-				// protect us from all deletion cases
-				// caused by ntrip_notify_close().
-				P_RWLOCK_UNLOCK(&caster->ntrips.lock);
-				goto restart;
-			}
+
+			// Restart from the head, skipping already done ids.
+			// TAILQ_FOREACH_SAFE is not a solution: does not
+			// protect us from all deletion cases
+			// caused by ntrip_notify_close().
+			P_RWLOCK_UNLOCK(&caster->ntrips.lock);
+			goto restart;
 		}
-		bufferevent_unlock(bev);
 	}
 	P_RWLOCK_UNLOCK(&caster->ntrips.lock);
 	return r;

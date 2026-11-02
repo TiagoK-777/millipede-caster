@@ -8,10 +8,13 @@
 
 #include "bitfield.h"
 #include "conf.h"
+#include "config.h"
 #include "ip.h"
 #include "json.h"
+#include "livesource.h"
 #include "log.h"
 #include "rtcm.h"
+#include "syncer.h"
 #include "util.h"
 
 static int urldecode_test() {
@@ -38,6 +41,44 @@ static int urldecode_test() {
 			printf("\nFAIL: %s vs %s\n", src, s->expect);
 			fail++;
 		}
+		free(src);
+	}
+	putchar('\n');
+	return fail;
+}
+
+/*
+ * hash_from_urlencoding(): key=value pairs from a query string or a form. A repeated key makes it
+ * fail; the value it had copied for that key leaked (visible under LeakSanitizer).
+ */
+static int hash_from_urlencoding_test() {
+	int fail = 0;
+	puts("hash_from_urlencoding");
+	struct utest {
+		char *send;
+		int ok;
+		char *key, *expect;
+	};
+	struct utest testlist[] = {
+		{"user=admin&password=%3dadminpw...", 1, "password", "=adminpw..."},
+		{"a&b=", 1, "a", ""},
+		{"x=1;y=2", 1, "y", "2"},
+		{"a=1&a=2", 0, NULL, NULL},
+		{"user=admin&password=x&user=y", 0, NULL, NULL},
+		{NULL, 0, NULL, NULL}
+	};
+	for (struct utest *t = testlist; t->send; t++) {
+		char *src = (char *)strdup(t->send);
+		struct hash_table *h = hash_from_urlencoding(src);
+		const char *v = h && t->key ? (const char *)hash_table_get(h, t->key) : NULL;
+		if ((h != NULL) == t->ok && (!t->ok || (v && !strcmp(v, t->expect))))
+			putchar('.');
+		else {
+			printf("\nFAIL: %s\n", t->send);
+			fail++;
+		}
+		if (h)
+			hash_table_free(h);
 		free(src);
 	}
 	putchar('\n');
@@ -82,6 +123,53 @@ static int b64_test() {
 	return fail;
 }
 
+static int nmea_checksum_test() {
+	puts("nmea_checksum");
+	int fail = 0;
+
+	struct cktest {
+		const char *sentence;
+		int cksum;
+		int ok;
+	};
+
+	struct cktest cktests[] = {
+	    /* Valid sentences, with the expected computed checksum */
+	    { "$GPGGA,014822.78,0000.0000000,N,00000.0000000,E,1,00,1.0,-17.162,M,17.162,M,0.0,*5C", 0x5C, 1 },
+	    { "$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 0x63, 1 },
+	    /* The claimed checksum is wrong */
+	    { "$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*64", 0x63, 0 },
+	    /* Garbage before the $ is skipped */
+	    { "ntrip-gga: $GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 0x63, 1 },
+	    /* Empty sentence body */
+	    { "$*00", 0, 1 },
+	    { "$*5A", 0, 0 },
+	    /* No $, no * */
+	    { "GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 0, 0 },
+	    { "$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000", 0, 0 },
+	    { NULL, 0, 0 }
+	};
+
+	for (struct cktest *t = cktests; t->sentence; t++) {
+		int cksum = -1, found;
+		if (nmea_checksum(t->sentence, &cksum, &found) < 0) {
+			if (t->ok) {
+				printf("FAIL: nmea_checksum(\"%s\") failed\n", t->sentence);
+				fail++;
+			} else
+				putchar('.');
+			continue;
+		}
+		if (!t->ok || cksum != t->cksum) {
+			printf("FAIL: nmea_checksum(\"%s\") = 0x%02X, expected 0x%02X\n", t->sentence, cksum, t->cksum);
+			fail++;
+		} else
+			putchar('.');
+	}
+	putchar('\n');
+	return fail;
+}
+
 static int gga_test() {
 	puts("parse_gga");
 	int fail = 0;
@@ -100,13 +188,21 @@ static int gga_test() {
 	    {"$GNGGA,205655.60,4849.4770477,N,00220.6693234,E,4,12,0.63,60.806,M,46.188,M,14.6,0000*6E", 48.824619, 2.344489},
 	    {"$GNGGA,104710.00,4832.5844943,N,00229.8320136,E,5,12,0.84,80.418,M,46.332,M,1.0,0000*5A", 48.543076, 2.497200},
 	    {"$GPGGA,182700,4609.8802,N,00056.9231,W,4,10,1,11.8,M,1,M,3,0*50", 46.164669, -0.948718},
-	    {"$GPGGA,182700,4609.8802,S,00056.9231,W,4,10,1,11.8,M,1,M,3,0*50", -46.164669, -0.948718},
+	    {"$GPGGA,182700,4609.8802,S,00056.9231,W,4,10,1,11.8,M,1,M,3,0*4D", -46.164669, -0.948718},
 	    {"$GPGGA,223105.79,4849.4654397,N,00220.6576662,E,1,00,1.0,69.071,M,44.857,M,0.0,*76", 48.824425, 2.344295},
 	    {"$GNGGA,103812.00,4511.0814681,N,00544.9383397,E,1,12,0.70,226.973,M,47.399,M,,*4E", 45.184692, 5.748972},
 	    {"$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 45.184605, 5.749639},
 	    {" $GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 45.184605, 5.749639},
-	    {"$GNGGA,172829.20,4546.2000000,N,00306.0000000,E,5,12,0.68,158.545,M,47.390,M,1.2,0000*6F", 45.77, 3.1},
+	    {"$GNGGA,172829.20,4546.2000000,N,00306.0000000,E,5,12,0.68,158.545,M,47.390,M,1.2,0000*66", 45.77, 3.1},
 	    {"ntrip-gga: $GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63", 45.184605, 5.749639},
+	    /* Lowercase checksum digits are accepted */
+	    {"$GNGGA,205655.60,4849.4770477,N,00220.6693234,E,4,12,0.63,60.806,M,46.188,M,14.6,0000*6e", 48.824619, 2.344489},
+	    /* No checksum */
+	    {"$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000", -1337., -1337.},
+	    /* Garbage after the checksum */
+	    {"$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63X", -1337., -1337.},
+	    /* Non-hex digit in checksum */
+	    {"$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*6g", -1337., -1337.},
 	    {NULL, 0., 0.}
 	};
 
@@ -124,6 +220,25 @@ static int gga_test() {
 			fail++;
 		}
 		putchar('.');
+	}
+
+	/*
+	 * Corrupted checksum: replace the checksum of a valid sentence
+	 * with a wrong one, derived from the real checksum.
+	 */
+	char bad_gga[] = "$GNGGA,103841.00,4511.0762921,N,00544.9783512,E,2,12,0.79,217.897,M,47.399,M,2.0,0000*63";
+	int cksum, found;
+	pos_t pos;
+	if (nmea_checksum(bad_gga, &cksum, &found) < 0) {
+		printf("FAIL: can't compute the checksum of %s\n", bad_gga);
+		fail++;
+	} else {
+		snprintf(bad_gga + strlen(bad_gga) - 2, 3, "%02X", (cksum + 1) & 0xff);
+		if (parse_gga(bad_gga, &pos) >= 0) {
+			printf("FAIL: parse_gga accepted a corrupted checksum: %s\n", bad_gga);
+			fail++;
+		} else
+			putchar('.');
 	}
 	putchar('\n');
 	return fail;
@@ -628,6 +743,50 @@ static void log_cb(void *arg, struct gelf_entry *g, int level, const char *fmt, 
 	putchar('\n');
 }
 
+/*
+ * syncer_queue_json() on the state a reload leaves behind.
+ *
+ * caster_reload_syncers() hands each syncer to the new dynconfig and nulls the entry in the old
+ * one, so a worker thread still holding the previous configuration sees syncers_count at 1 with
+ * syncers[0] already NULL. syncer_queue_json() tested the count and dereferenced the entry, and
+ * the caster died on any livesource change during a reload. This builds that state directly
+ * instead of waiting for the race.
+ */
+static int test_syncer_queue_json_handed_over() {
+	int fail = 0;
+
+	puts("test_syncer_queue_json_handed_over");
+
+	struct caster_state caster;
+	struct config config;
+	struct caster_dynconfig dyn;
+	struct syncer *syncers[1] = {NULL};
+
+	memset(&caster, 0, sizeof caster);
+	memset(&config, 0, sizeof config);
+	memset(&dyn, 0, sizeof dyn);
+	log_init(&caster.flog, NULL, &log_cb, -1, -1, -1, -1, &caster.flog);
+	P_RWLOCK_INIT(&caster.configlock, NULL);
+	REFCNT_INIT(&config);
+	dyn.syncers = syncers;
+	dyn.syncers_count = 1;
+	config.dyn = &dyn;
+	atomic_store(&caster.config, &config);
+
+	syncer_queue_json(&caster, json_object_new_object());
+
+	/* the configuration reference taken must have been given back */
+	if (atomic_load(&config.refcnt) != 1) {
+		fail++;
+		printf("FAIL: configuration refcnt %d after syncer_queue_json, expected 1\n",
+			atomic_load(&config.refcnt));
+	} else
+		putchar('.');
+
+	putchar('\n');
+	return fail;
+}
+
 static int file_parse_test(const char *test_dir) {
 	struct log flog;
 	log_init(&flog, NULL, &log_cb, -1, -1, -1, -1, &flog);
@@ -685,6 +844,71 @@ static int file_parse_test(const char *test_dir) {
 	return fail;
 }
 
+/*
+ * Prefix tables with an empty address family: completely empty, only IPv4 or only
+ * IPv6 prefixes. Sorting must not pass a NULL entries array to qsort(), which is undefined
+ * behaviour even for 0 elements (fatal under -fsanitize=undefined, at startup and on reload).
+ */
+static int test_prefix_table_empty(const char *test_dir) {
+	struct log flog;
+	log_init(&flog, NULL, &log_cb, -1, -1, -1, -1, &flog);
+
+	int fail = 0;
+	puts("test_prefix_table_empty");
+
+	struct test {
+		const char *parse;
+		int expect;
+	};
+
+	struct test test_none[] = {
+		{"192.168.1.1", -1},
+		{"9:9::9:9", -1},
+		{NULL, 0}
+	};
+	struct test test_v4[] = {
+		{"10.1.2.3", 5},
+		{"192.168.1.1", -1},
+		{"9:9::9:9", -1},
+		{NULL, 0}
+	};
+	struct test test_v6[] = {
+		{"9:9::9:9", 7},
+		{"10.1.2.3", -1},
+		{NULL, 0}
+	};
+
+	struct prefix_table *tables[3];
+	struct test *tests[3] = { test_none, test_v4, test_v6 };
+
+	tables[0] = prefix_table_new();
+
+	tables[1] = prefix_table_new();
+	prefix_table_add(tables[1], prefix_quota_parse("10.0.0.0/8", "5"));
+	prefix_table_sort(tables[1]);
+
+	tables[2] = prefix_table_new();
+	prefix_table_add(tables[2], prefix_quota_parse("9:9::/32", "7"));
+	prefix_table_sort(tables[2]);
+
+	for (int i = 0; i < 3; i++) {
+		union sock addr;
+		for (struct test *tl = tests[i]; tl->parse; tl++) {
+			ip_convert(tl->parse, &addr);
+			int quota = prefix_table_get_quota(tables[i], &addr);
+			if (quota != tl->expect) {
+				fail++;
+				printf("FAIL on table %d, %s: %d instead of %d\n", i, tl->parse, quota, tl->expect);
+			} else
+				putchar('.');
+		}
+		prefix_table_free(tables[i]);
+	}
+
+	putchar('\n');
+	return fail;
+}
+
 #if 0
 static void sourcetable_test(struct sourcetable *sourcetable) {
 	char *ggalist[] = {
@@ -710,6 +934,63 @@ static void sourcetable_test(struct sourcetable *sourcetable) {
 	}
 }
 #endif
+
+static int test_livesource_convert_state() {
+	int fail = 0;
+	puts("test_livesource_convert_state");
+	struct test {
+		const char *str;
+		enum livesource_state expect;
+	};
+	struct test testlist[] = {
+		{"INVALID", LIVESOURCE_STATE_INVALID},
+		{"***", LIVESOURCE_STATE_INVALID},
+		{"INIT", LIVESOURCE_INIT},
+		{"FETCH_PENDING", LIVESOURCE_FETCH_PENDING},
+		{"RUNNING", LIVESOURCE_RUNNING},
+		{NULL, 0}
+	};
+
+	for (struct test *t = testlist; t->str; t++) {
+		enum livesource_state r = livesource_convert_state(t->str);
+		if (r != t->expect) {
+			fail++;
+			printf("\nFAIL: livesource state \"%s\" got %d, expected %d\n",
+				t->str, r, t->expect);
+		} else
+			putchar('.');
+	}
+	putchar('\n');
+	return fail;
+}
+
+static int test_livesource_convert_type() {
+	int fail = 0;
+	puts("test_livesource_convert_type");
+	struct test {
+		const char *str;
+		enum livesource_type expect;
+	};
+	struct test testlist[] = {
+		{"INVALID", LIVESOURCE_TYPE_INVALID},
+		{"***", LIVESOURCE_TYPE_INVALID},
+		{"DIRECT", LIVESOURCE_TYPE_DIRECT},
+		{"FETCHED", LIVESOURCE_TYPE_FETCHED},
+		{NULL, 0}
+	};
+
+	for (struct test *t = testlist; t->str; t++) {
+		enum livesource_type r = livesource_convert_type(t->str);
+		if (r != t->expect) {
+			fail++;
+			printf("\nFAIL: livesource type \"%s\" got %d, expected %d\n",
+				t->str, r, t->expect);
+		} else
+			putchar('.');
+	}
+	putchar('\n');
+	return fail;
+}
 
 /*
  * Regression test for json_get_authentication mountpoint lookup.
@@ -797,17 +1078,23 @@ int main(int argc, const char **argv) {
 	else
 		test_dir = argv[1];
 	fail += gga_test();
+	fail += nmea_checksum_test();
 	fail += b64_test();
 	fail += test_ip_analyze_prefixquota();
 	fail += urldecode_test();
+	fail += hash_from_urlencoding_test();
 	fail += test_getbits();
 	fail += test_setbits();
 	fail += test_rtcm_typeset_parse();
 	fail += test_prefix_table();
+	fail += test_syncer_queue_json_handed_over();
 	fail += test_ip_convert();
 	fail += test_msm7_msm4();
 	fail += timeval_from_iso_date_test();
 	fail += test_json_get_authentication();
 	fail += file_parse_test(test_dir);
+	fail += test_prefix_table_empty(test_dir);
+	fail += test_livesource_convert_state();
+	fail += test_livesource_convert_type();
 	return fail != 0;
 }

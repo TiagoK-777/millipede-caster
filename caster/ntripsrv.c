@@ -39,6 +39,7 @@ static struct httpcode httpcodes[] = {
 	{405, "Method Not Allowed"},
 	{409, "Conflict"},
 	{413, "Content Too Large"},
+	{415, "Unsupported Media Type"},
 	{431, "Request Header Fields Too Large"},
 	{500, "Internal Server Error"},
 	{501, "Not Implemented"},
@@ -122,7 +123,7 @@ static int _ntripsrv_send_result_ok(struct ntrip_state *this, struct evbuffer *o
 	struct evkeyvalq headers;
 	struct evkeyval *np;
 	if (this->client_version == 1) {
-		evbuffer_add_reference(output, "ICY 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 52, NULL, NULL);
+		evbuffer_add_reference(output, "ICY 200 OK\r\n\r\n", 14, NULL, NULL);
 		this->sent_bytes += 52;
 	} else {
 		TAILQ_INIT(&headers);
@@ -654,6 +655,9 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 								ntrip_set_state(st, NTRIP_WAIT_CLIENT_CONTENT);
 							else
 								ntrip_set_state(st, NTRIP_WAIT_HTTP_METHOD);
+							/* A pipelined request reads its own line: free ours first */
+							free(line);
+							line = NULL;
 							continue;
 						} else {
 							ntrip_set_state(st, NTRIP_WAIT_CLOSE);
@@ -727,6 +731,8 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 							ntrip_set_state(st, NTRIP_WAIT_CLIENT_CONTENT);
 							struct timeval adm_read_timeout = { 0, 0 };
 							bufferevent_set_timeouts(bev, &adm_read_timeout, NULL);
+							free(line);
+							line = NULL;
 							continue;
 						}
 						if (!st->scheme_basic) {
@@ -882,7 +888,12 @@ void ntripsrv_readcb(struct bufferevent *bev, void *arg) {
 		else if (err >= 100)
 			send_server_reply(st, output, err, &opt_headers, NULL, NULL);
 		ntrip_log(st, LOG_EDEBUG, "ntripsrv_readcb err %d", err);
-		ntrip_set_state(st, NTRIP_WAIT_CLOSE);
+		if (evbuffer_get_length(output) == 0)
+			/* Nothing to send, force close */
+			ntrip_set_state(st, NTRIP_FORCE_CLOSE);
+		else
+			/* Wait for a write callback before closing, to flush the remaining data */
+			ntrip_set_state(st, NTRIP_WAIT_CLOSE);
 	}
 	evhttp_clear_headers(&opt_headers);
 	if (ntrip_get_state(st) == NTRIP_FORCE_CLOSE)

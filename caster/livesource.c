@@ -21,8 +21,8 @@
 #include "queue.h"
 #include "util.h"
 
-static const char *livesource_states[4] = {"INIT", "FETCH_PENDING", "RUNNING", NULL};
-static const char *livesource_types[3] = {"DIRECT", "FETCHED", NULL};
+static const char *livesource_states[] = {"INVALID", "INIT", "FETCH_PENDING", "RUNNING", NULL};
+static const char *livesource_types[] = {"INVALID", "DIRECT", "FETCHED", NULL};
 static const char *livesource_update_types[4] = {"none", "add", "del", "update"};
 
 static void livesource_free(struct livesource *this);
@@ -173,15 +173,27 @@ static int livesource_kill_subscribers_unlocked(struct livesource *this, int kil
 			killed++;
 		} else if (kill_backlogged == 0 && virtual) {
 			/*
-			 * Try to resubscribe virtual sources to a new source
+			 * Try to resubscribe virtual sources to a new source.
+			 *
+			 * In unthreaded mode the call to ntripsrv_redo_virtual_pos() runs inline,
+			 * so we need to unsubscribe before the call, instead of relying on the
+			 * call to _livesource_del_subscriber_unlocked() in the next if.
 			 */
+			_livesource_del_subscriber_unlocked(st);
 			joblist_append_ntrip_locked(st->caster->joblist, st, &ntripsrv_redo_virtual_pos);
+			bufferevent_unlock(bev);
+			continue;
 		}
 
 		if (kill_backlogged == 0 || backlogged) {
+			/*
+			 * Here a subscriber is either backlogged, or a direct one of a closed source
+			 * (virtual ones were moved to another source above): close it in both cases,
+			 * so that a client too slow to follow reconnects rather than waits for data
+			 * that will not come.
+			 */
 			_livesource_del_subscriber_unlocked(st);
-			if (!backlogged && !virtual)
-				ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
+			ntrip_decref_end(st, "livesource_kill_subscribers_unlocked");
 		}
 		bufferevent_unlock(bev);
 	}
@@ -267,21 +279,32 @@ static void _livesource_del_subscriber_unlocked(struct ntrip_state *st) {
 
 void livesource_del_subscriber(struct ntrip_state *st) {
 	/*
+	 * Read the subscription under the ntrip_state lock: the livesource can drop it
+	 * (livesource_kill_subscribers_unlocked(), with both locks held) and free it
+	 * at any time otherwise.
+	 */
+	bufferevent_lock(st->bev);
+	struct subscriber *sub = st->subscription;
+	struct livesource *livesource = sub ? sub->livesource : NULL;
+	if (livesource)
+		livesource_incref(livesource);
+	bufferevent_unlock(st->bev);
+	if (livesource == NULL)
+		return;
+
+	/*
 	 * Lock order is mandatory to avoid deadlocks with livesource_send_subscribers
 	 */
-	struct subscriber *sub = st->subscription;
-	if (sub) {
-		struct livesource *livesource = sub->livesource;
-		livesource_incref(livesource);
-		P_RWLOCK_WRLOCK(&livesource->lock);
-		bufferevent_lock(st->bev);
+	P_RWLOCK_WRLOCK(&livesource->lock);
+	bufferevent_lock(st->bev);
 
+	/* The subscription may have been dropped while no lock was held */
+	if (st->subscription && st->subscription->livesource == livesource)
 		_livesource_del_subscriber_unlocked(st);
 
-		bufferevent_unlock(st->bev);
-		P_RWLOCK_UNLOCK(&livesource->lock);
-		livesource_decref(livesource);
-	}
+	bufferevent_unlock(st->bev);
+	P_RWLOCK_UNLOCK(&livesource->lock);
+	livesource_decref(livesource);
 }
 
 /*
@@ -335,9 +358,14 @@ int livesource_send_subscribers(struct livesource *this, struct packet *packet, 
 		p = packet;
 		if (atomic_load(&st->use_rtcm_filter)) {
 			bufferevent_lock(bev);
-			if (!rtcm_filter_pass(st->config->dyn->rtcm_filter, packet)) {
+			/*
+			 * use_rtcm_filter was decided when the client subscribed; st->config follows
+			 * reloads since, and a reload may have removed the rtcm_filter block.
+			 */
+			struct rtcm_filter *filter = st->config->dyn->rtcm_filter;
+			if (filter != NULL && !rtcm_filter_pass(filter, packet)) {
 				if (!pconv)
-					pconv = rtcm_filter_convert(st->config->dyn->rtcm_filter, st, packet);
+					pconv = rtcm_filter_convert(filter, st, packet);
 				p = pconv;
 			}
 			bufferevent_unlock(bev);
@@ -500,7 +528,7 @@ static struct livesource *livesource_find_unlocked(struct caster_state *this, st
 			return NULL;
 		}
 		assert(r != -1);
-		if (*jp)
+		if (jp)
 			*jp = livesource_update_json(np, this, LIVESOURCE_UPDATE_ADD);
 		this->livesources->serial++;
 		ntrip_log(st, LOG_INFO, "Trying to subscribe to on-demand source %s", mountpoint);
@@ -721,22 +749,39 @@ static json_object *livesource_update_json(struct livesource *this,
  * Update receipt routines.
  */
 
-static enum livesource_state convert_state(const char *state) {
-	const char **statep = livesource_states;
-	for (int i = 0; *statep; i++) {
+/*
+ * Convert a state to its index, or LIVESOURCE_STATE_INVALID if unknown or absent.
+ */
+enum livesource_state livesource_convert_state(const char *state) {
+	const char **statep = &livesource_states[1];
+	if (state == NULL)
+		return LIVESOURCE_STATE_INVALID;
+	for (int i = 1; *statep; i++) {
 		if (!strcmp(*statep++, state))
 			return i;
 	}
-	return -1;
+	return LIVESOURCE_STATE_INVALID;
 }
 
-static enum livesource_type convert_type(const char *type) {
-	const char **typep = livesource_types;
-	for (int i = 0; *typep; i++) {
+/*
+ * Convert a type to its index, or LIVESOURCE_TYPE_INVALID if unknown or absent.
+ */
+enum livesource_type livesource_convert_type(const char *type) {
+	const char **typep = &livesource_types[1];
+	if (type == NULL)
+		return LIVESOURCE_TYPE_INVALID;
+	for (int i = 1; *typep; i++) {
 		if (!strcmp(*typep++, type))
 			return i;
 	}
-	return -1;
+	return LIVESOURCE_TYPE_INVALID;
+}
+
+static void convert_state_type_from_json(json_object *j, enum livesource_state *state, enum livesource_type *type) {
+	const char *jtype = json_object_get_string(json_object_object_get(j, "type"));
+	const char *jstate = json_object_get_string(json_object_object_get(j, "state"));
+	*state = livesource_convert_state(jstate);
+	*type = livesource_convert_type(jtype);
 }
 
 /*
@@ -779,6 +824,10 @@ static int livesource_update_execute_diff(struct caster_state *caster, struct li
 		return 404;
 	}
 	const char *mountpoint = json_object_get_string(json_object_object_get(ls, "mountpoint"));
+	if (mountpoint == NULL) {
+		logfmt(&caster->flog, LOG_NOTICE, "'mountpoint' not found");
+		return 404;
+	}
 
 	struct livesource_remote *lr = (struct livesource_remote *)hash_table_get(lrlist->hash, mountpoint);
 
@@ -787,11 +836,17 @@ static int livesource_update_execute_diff(struct caster_state *caster, struct li
 			logfmt(&caster->flog, LOG_NOTICE, "update failed: %s exists", mountpoint);
 			return 404;
 		}
+		enum livesource_state state;
+		enum livesource_type type;
+		convert_state_type_from_json(ls , &state, &type);
+
+		if (state == LIVESOURCE_STATE_INVALID || type == LIVESOURCE_TYPE_INVALID) {
+			logfmt(&caster->flog, LOG_WARNING, "update failed: unknown state or type for %s", mountpoint);
+			return 503;
+		}
 		lr = livesource_remote_new(mountpoint);
-		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
-		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
-		lr->state = convert_state(lsstate);
-		lr->type = convert_type(lstype);
+		lr->state = state;
+		lr->type = type;
 		r = hash_table_add(lrlist->hash, mountpoint, lr);
 		assert(r != -1);
 		if (r == -2) {
@@ -811,10 +866,15 @@ static int livesource_update_execute_diff(struct caster_state *caster, struct li
 			logfmt(&caster->flog, LOG_NOTICE, "update failed: mountpoint %s does not exist", mountpoint);
 			return 503;
 		}
-		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
-		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
-		lr->state = convert_state(lsstate);
-		lr->type = convert_type(lstype);
+		enum livesource_state state;
+		enum livesource_type type;
+		convert_state_type_from_json(ls , &state, &type);
+		if (state == LIVESOURCE_STATE_INVALID || type == LIVESOURCE_TYPE_INVALID) {
+			logfmt(&caster->flog, LOG_NOTICE, "update failed: unknown state or type for %s", mountpoint);
+			return 503;
+		}
+		lr->state = state;
+		lr->type = type;
 	} else {
 		logfmt(&caster->flog, LOG_NOTICE, "update failed: unknown type %s", type);
 		return 503;
@@ -837,6 +897,14 @@ static struct livesources_remote *livesource_process_fulltable(struct caster_sta
 	if (lslist == NULL || jserial == NULL || start_date == NULL || hostname == NULL || jendpoints == NULL)
 		return NULL;
 
+	/*
+	 * Protect against a peer sending anything other than an object under "livesources".
+	 */
+	if (!json_object_is_type(lslist, json_type_object)) {
+		logfmt(&caster->flog, LOG_WARNING, "livesource table from %s: 'livesources' is not an object", hostname);
+		return NULL;
+	}
+
 	int endpoint_count;
 
 	struct endpoint *pe = endpoints_from_json(jendpoints, &endpoint_count);
@@ -857,12 +925,20 @@ static struct livesources_remote *livesource_process_fulltable(struct caster_sta
 	while (!json_object_iter_equal(&it, &itEnd)) {
 		const char *mountpoint = json_object_iter_peek_name(&it);
 		struct json_object *ls = json_object_iter_peek_value(&it);
-		const char *lstype = json_object_get_string(json_object_object_get(ls, "type"));
-		const char *lsstate = json_object_get_string(json_object_object_get(ls, "state"));
+		enum livesource_state state;
+		enum livesource_type type;
+		convert_state_type_from_json(ls, &state, &type);
+		if (state == LIVESOURCE_STATE_INVALID || type == LIVESOURCE_TYPE_INVALID) {
+			logfmt(&caster->flog, LOG_WARNING,
+				"livesource %s from %s: unknown state or type, ignoring",
+				mountpoint, hostname);
+			json_object_iter_next(&it);
+			continue;
+		}
 
 		struct livesource_remote *lr = livesource_remote_new(mountpoint);
-		lr->state = convert_state(lsstate);
-		lr->type = convert_type(lstype);
+		lr->state = state;
+		lr->type = type;
 
 		int r = hash_table_add(remote->hash, mountpoint, lr);
 		assert(r != -1);

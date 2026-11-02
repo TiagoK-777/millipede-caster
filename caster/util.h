@@ -36,7 +36,7 @@ struct mime_content {
 	char *s;
 	const char *mime_type;
 	size_t len;
-	int use_strfree, is_packet;
+	int use_strfree;
 	struct packet *packet;
 };
 STAILQ_HEAD(mimeq, mime_content);
@@ -59,6 +59,7 @@ char *urldecode(char *s);
 char *b64encode(const char *str, size_t len, int add_nul);
 char *b64decode(char *str, size_t len, int add_nul);
 unsigned long crc24q_hash(unsigned char *data, size_t len);
+int nmea_checksum(const char *line, int *pcksum, int *pfound);
 int parse_gga(const char *line, pos_t *pos);
 char *host_port_str(char *host, unsigned short port);
 char *mystrdup(const char *str);
